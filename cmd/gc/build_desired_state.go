@@ -89,7 +89,7 @@ type defaultScaleCheckTarget struct {
 
 var (
 	errPoolSessionCreateBudgetExhausted = errors.New("pool session create budget exhausted")
-	errPoolScaleCheckPartialCreate      = errors.New("pool session create blocked: scale_check partial")
+	errPoolSessionCreatePartial         = errors.New("pool session create skipped: demand read partial")
 )
 
 // poolSessionCreateFairShareCounter rotates scarce create tokens across
@@ -1900,8 +1900,15 @@ func discoverSessionBeadsWithRoots(
 				desiredHasCanonicalNonExpandingPoolSession(desired, template, cfgAgent) {
 				continue
 			}
+			// Use a narrower partial-alive guard than scaleCheckPartial here: for
+			// creating/start-pending beads, only protect in-flight creates with an
+			// active pending_create_claim lease; stale creates (lease cleared/expired)
+			// roll back even during a partial tick. For all other states (active, awake,
+			// asleep, stopped, …) the broad preservable rule applies unchanged.
+			poolPartialAlive := (poolScaleCheckPartial || namedScaleCheckPartial) &&
+				(isPendingPoolCreate(b) || (!creating && scaleCheckPartialSessionPreservable(b)))
 			if controllerManagedPool && !manualSession && !isNamedSessionBead(b) &&
-				!sessionAlreadyDesired && !templateDesired && !scaleCheckPartial {
+				!sessionAlreadyDesired && !templateDesired && !poolPartialAlive {
 				continue
 			}
 			if !manualSession && (!creating || isStaleCreating(b)) && !templateDesired && !pendingCreate && !scaleCheckPartial {
@@ -2194,8 +2201,8 @@ func realizePoolDesiredSessions(
 				switch {
 				case errors.Is(err, errPoolSessionCreateBudgetExhausted):
 					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (fresh create deferred)\n", qualifiedName, err) //nolint:errcheck
-				case errors.Is(err, errPoolScaleCheckPartialCreate):
-					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: scale_check partial — new create skipped\n", qualifiedName) //nolint:errcheck
+				case errors.Is(err, errPoolSessionCreatePartial):
+					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (partial demand read, fresh create blocked)\n", qualifiedName, err) //nolint:errcheck
 				default:
 					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (skipping)\n", qualifiedName, err) //nolint:errcheck
 				}
@@ -2953,7 +2960,7 @@ func selectOrPlanPoolSessionBead(
 
 	if bp.poolScaleCheckPartialTemplates[template] {
 		delete(usedSlots, slot)
-		return beads.Bead{}, 0, nil, errPoolScaleCheckPartialCreate
+		return beads.Bead{}, 0, nil, errPoolSessionCreatePartial
 	}
 
 	if !bp.tryClaimPoolSessionCreate(template) {
