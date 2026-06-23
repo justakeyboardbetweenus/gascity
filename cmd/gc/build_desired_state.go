@@ -87,7 +87,10 @@ type defaultScaleCheckTarget struct {
 	err      error
 }
 
-var errPoolSessionCreateBudgetExhausted = errors.New("pool session create budget exhausted")
+var (
+	errPoolSessionCreateBudgetExhausted = errors.New("pool session create budget exhausted")
+	errPoolSessionCreateProviderRed     = errors.New("pool session create skipped: provider red")
+)
 
 // poolSessionCreateFairShareCounter rotates scarce create tokens across
 // contending pools so stable template sort order does not always win.
@@ -735,6 +738,7 @@ func buildDesiredStateWithSessionBeads(
 		}
 		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, sessionBeads.Open(), assignedWorkBeads, assignedWorkStoreRefs)
 		bp.assignedWorkBeads = poolWorkBeads
+		bp.providerHealthSnapshot = loadProviderHealthSnapshot(cityPath)
 		poolDesiredStates := ComputePoolDesiredStatesTraced(cfg, poolWorkBeads, sessionBeads.Open(), scaleCheckCounts, trace)
 		bp.configurePoolSessionCreateFairShare(poolDesiredStates)
 		for _, poolState := range poolDesiredStates {
@@ -751,6 +755,7 @@ func buildDesiredStateWithSessionBeads(
 	} else {
 		// No store — use scale_check counts directly.
 		scaleCheckCounts, _ = evaluatePendingPoolsMap(cfg, pendingPools, stderr, trace)
+		bp.providerHealthSnapshot = loadProviderHealthSnapshot(cityPath)
 		for _, pw := range pendingPools {
 			cfgAgent := &cfg.Agents[pw.agentIdx]
 			desiredCount := scaleCheckCounts[cfgAgent.QualifiedName()]
@@ -2184,9 +2189,13 @@ func realizePoolDesiredSessions(
 			}
 			sessionBead, slot, plan, err := selectOrPlanPoolSessionBead(bp, cfgAgent, qualifiedName, prefer, used, usedSlots)
 			if err != nil {
-				if errors.Is(err, errPoolSessionCreateBudgetExhausted) {
+				switch {
+				case errors.Is(err, errPoolSessionCreateBudgetExhausted):
 					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (fresh create deferred)\n", qualifiedName, err) //nolint:errcheck
-				} else {
+				case errors.Is(err, errPoolSessionCreateProviderRed):
+					// debug-level: fires every tick during a red episode; not operator noise
+					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (provider red, fresh create blocked)\n", qualifiedName, err) //nolint:errcheck
+				default:
 					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (skipping)\n", qualifiedName, err) //nolint:errcheck
 				}
 				item.skip = true
@@ -2940,6 +2949,24 @@ func selectOrPlanPoolSessionBead(
 	}
 	slot := claimDesiredPoolSlot(bp.city, cfgAgent, beads.Bead{}, usedSlots)
 	_, qualifiedInstance, poolSlot := poolDesiredRequestIdentity(cfgAgent, slot)
+
+	// Provider-health gate: refuse new creates when the registry reports this
+	// agent's provider as red. Reuse paths above are unaffected (they return
+	// before reaching this point). Fail-open when providerHealthSnapshot is nil.
+	// Symmetric with the respawn gate in session_reconciler.go:2424.
+	if bp.providerHealthSnapshot != nil {
+		provName := strings.TrimSpace(cfgAgent.Provider)
+		if provName == "" {
+			provName = strings.TrimSpace(cfgAgent.InheritedProvider)
+		}
+		if provName == "" && bp.workspace != nil {
+			provName = strings.TrimSpace(bp.workspace.Provider)
+		}
+		if healthy, present := bp.providerHealthSnapshot.check(provName); present && !healthy {
+			delete(usedSlots, slot)
+			return beads.Bead{}, 0, nil, errPoolSessionCreateProviderRed
+		}
+	}
 
 	if !bp.tryClaimPoolSessionCreate(template) {
 		delete(usedSlots, slot)
